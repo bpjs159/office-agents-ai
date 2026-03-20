@@ -1,0 +1,35 @@
+{
+  "name": "office-agents-ai",
+  "version": "1.0.0",
+  "description": "This is an office agents AI orchestrator repository to spawn multiple agents that work together",
+  "main": "office.ts",
+  "scripts": {
+    "start": "if lsof -iTCP:8000 -sTCP:LISTEN -n -P >/dev/null; then echo 'Using existing Chroma server on localhost:8000'; else npx chroma run --path ./chroma-db & fi; until curl -sf http://localhost:8000/api/v2/heartbeat > /dev/null; do sleep 1; done; tsx office.ts",
+    "start:with-no-chroma": "tsx office.ts",
+    "chroma:run": "npx chroma run --path ./chroma-db",
+    "build": "tsc -p tsconfig.json",
+    "test": "echo \"No tests configured\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bpjs159/office-agents-ai.git"
+  },
+  "author": "Sebastian Bonilla",
+  "license": "ISC",
+  "dependencies": {
+    "chromadb": "^3.1.4",
+    "consola": "^3.4.2",
+    "dotenv": "^16.4.7",
+    "openai": "^4.86.2",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.11",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  },
+  "bugs": {
+    "url": "https://github.com/bpjs159/office-agents-ai/issues"
+  },
+  "homepage": "https://github.com/bpjs159/office-agents-ai#readme"
+}

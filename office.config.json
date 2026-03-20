@@ -1,0 +1,19 @@
+{
+  "standupIntervalMinutes": 5,
+  "standupLeader": "pedro-redactor",
+  "mainTarget": "Un equipo de investigación encargado de buscar noticias falsas del gobierno de Colombia, desmentirlas con datos reales y verificar también las noticias verdaderas. Pedro debe generar informes en markdown en cada standup.",
+  "mcpServers": {
+    "terminal": {
+      "enabled": true,
+      "description": "MCP server for terminal manipulation"
+    },
+    "files": {
+      "enabled": true,
+      "description": "MCP server for file operations"
+    },
+    "internet": {
+      "enabled": true,
+      "description": "MCP server for internet access"
+    }
+  }
+}
