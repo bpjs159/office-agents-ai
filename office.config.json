@@ -1,7 +1,7 @@
 {
   "standupIntervalMinutes": 5,
   "standupLeader": "pedro-redactor",
-  "mainTarget": "Un equipo de investigación encargado de buscar noticias falsas del gobierno de Colombia, desmentirlas con datos reales y verificar también las noticias verdaderas. Pedro debe generar informes en markdown en cada standup.",
+  "mainTarget": "Un equipo de investigación encargado de buscar noticias falsas del gobierno de Colombia para el año 2026, desmentirlas con datos reales y verificar también las noticias verdaderas. Pedro debe generar informes en markdown en cada standup, incluyendo las noticias investigadas con sus respectivas fuentes.",
   "mcpServers": {
     "terminal": {
       "enabled": true,

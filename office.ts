@@ -40,6 +40,12 @@ interface MemoryStore {
 	query(agentName: string, query: string, limit: number): Promise<MemoryItem[]>;
 }
 
+interface WebSearchResult {
+	title: string;
+	url: string;
+	snippet: string;
+}
+
 const CHROMA_URL = process.env.CHROMA_URL ?? "http://localhost:8000";
 
 function createChromaClientOptions(urlValue: string): { host: string; port: number; ssl: boolean } {
@@ -494,6 +500,22 @@ class OfficeOrchestrator {
 			const op = String(message.op ?? "");
 			const payload = (message.payload ?? {}) as Record<string, unknown>;
 			try {
+				if (op === "web-search") {
+					if (!this.hasMcpAccess(fromAgent, "internet")) {
+						runtime.process.send({
+							type: "workspace-result",
+							requestId,
+							error: "MCP access denied: internet",
+						});
+						return;
+					}
+					const query = String(payload.query ?? "").trim();
+					const limit = Number(payload.limit ?? 5);
+					const result = await this.searchInternet(query, limit);
+					runtime.process.send({ type: "workspace-result", requestId, data: result });
+					return;
+				}
+
 				if (op === "create-file") {
 					if (!this.hasMcpAccess(fromAgent, "files")) {
 						runtime.process.send({
@@ -537,6 +559,132 @@ class OfficeOrchestrator {
 				});
 			}
 		}
+	}
+
+	private decodeHtmlEntities(text: string): string {
+		return text
+			.replace(/&amp;/g, "&")
+			.replace(/&quot;/g, '"')
+			.replace(/&#39;|&apos;/g, "'")
+			.replace(/&lt;/g, "<")
+			.replace(/&gt;/g, ">")
+			.replace(/&nbsp;/g, " ")
+			.replace(/&#(\d+);/g, (_match, code) => String.fromCharCode(Number(code)));
+	}
+
+	private stripHtml(text: string): string {
+		return this.decodeHtmlEntities(text.replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+	}
+
+	private unwrapDuckDuckGoUrl(rawUrl: string): string {
+		try {
+			const parsed = new URL(rawUrl, "https://duckduckgo.com");
+			if (parsed.hostname.includes("duckduckgo.com") && parsed.pathname === "/l/") {
+				const target = parsed.searchParams.get("uddg");
+				if (target) {
+					return decodeURIComponent(target);
+				}
+			}
+			return parsed.toString();
+		} catch {
+			return rawUrl;
+		}
+	}
+
+	private async searchDuckDuckGo(query: string, limit: number): Promise<WebSearchResult[]> {
+		const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+		const response = await fetch(url, {
+			headers: {
+				"user-agent": "Mozilla/5.0 (compatible; office-agents-ai/1.0)",
+			},
+		});
+		if (!response.ok) {
+			throw new Error(`DuckDuckGo request failed (${response.status})`);
+		}
+
+		const html = await response.text();
+		const resultRegex = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+		const snippetRegex = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>|<td[^>]*class="result-snippet"[^>]*>([\s\S]*?)<\/td>/g;
+
+		const snippets: string[] = [];
+		let snippetMatch: RegExpExecArray | null = snippetRegex.exec(html);
+		while (snippetMatch) {
+			snippets.push(this.stripHtml(snippetMatch[1] ?? snippetMatch[2] ?? ""));
+			snippetMatch = snippetRegex.exec(html);
+		}
+
+		const results: WebSearchResult[] = [];
+		let linkMatch: RegExpExecArray | null = resultRegex.exec(html);
+		while (linkMatch && results.length < limit) {
+			const rawLink = String(linkMatch[1] ?? "").trim();
+			const title = this.stripHtml(String(linkMatch[2] ?? "").trim());
+			if (!rawLink || !title) {
+				linkMatch = resultRegex.exec(html);
+				continue;
+			}
+
+			const urlValue = this.unwrapDuckDuckGoUrl(rawLink);
+			if (!/^https?:\/\//i.test(urlValue)) {
+				linkMatch = resultRegex.exec(html);
+				continue;
+			}
+
+			results.push({
+				title,
+				url: urlValue,
+				snippet: snippets[results.length] ?? "",
+			});
+			linkMatch = resultRegex.exec(html);
+		}
+
+		return results;
+	}
+
+	private async searchWikipedia(query: string, limit: number): Promise<WebSearchResult[]> {
+		const url = `https://es.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
+			query,
+		)}&utf8=1&format=json&srlimit=${Math.max(1, Math.min(limit, 10))}`;
+		const response = await fetch(url);
+		if (!response.ok) {
+			throw new Error(`Wikipedia request failed (${response.status})`);
+		}
+		const data = (await response.json()) as {
+			query?: { search?: Array<{ title: string; snippet: string; pageid: number }> };
+		};
+
+		const items = data.query?.search ?? [];
+		return items.slice(0, limit).map((item) => ({
+			title: item.title,
+			url: `https://es.wikipedia.org/?curid=${item.pageid}`,
+			snippet: this.stripHtml(item.snippet),
+		}));
+	}
+
+	private async searchInternet(
+		query: string,
+		limit: number,
+	): Promise<{ query: string; fetchedAt: string; results: WebSearchResult[] }> {
+		if (!query.trim()) {
+			throw new Error("query is required for web-search");
+		}
+		const safeLimit = Math.max(1, Math.min(Number.isFinite(limit) ? limit : 5, 10));
+
+		let results: WebSearchResult[] = [];
+		try {
+			results = await this.searchDuckDuckGo(query, safeLimit);
+		} catch {
+			results = [];
+		}
+
+		if (!results.length) {
+			results = await this.searchWikipedia(query, safeLimit).catch(() => []);
+		}
+
+		return {
+			query,
+			fetchedAt: new Date().toISOString(),
+			results,
+		};
 	}
 
 	private async createAgentFile(

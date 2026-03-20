@@ -17,6 +17,18 @@ interface WorkerMessage {
 	[key: string]: unknown;
 }
 
+interface InternetSearchResult {
+	title: string;
+	url: string;
+	snippet: string;
+}
+
+interface InternetSearchResponse {
+	query: string;
+	fetchedAt: string;
+	results: InternetSearchResult[];
+}
+
 const pendingMemory = new Map<
 	string,
 	{ resolve: (value: unknown) => void; reject: (error: Error) => void }
@@ -32,6 +44,8 @@ let profile: AgentProfile = {
 	mcpAccess: [],
 	peers: [],
 };
+
+const currentStandupReports = new Map<string, string>();
 
 const TRACE_ENABLED = (process.env.AGENT_TRACE ?? "1") !== "0";
 let llmTraceEnabled = (process.env.AGENT_LLM_TRACE ?? "0") === "1";
@@ -88,6 +102,62 @@ function requestWorkspace(op: string, payload: Record<string, unknown>): Promise
 			reject(new Error(`Workspace timeout for ${requestId}`));
 		}, 20000);
 	});
+}
+
+function hasInternetAccess(): boolean {
+	return profile.mcpAccess.includes("internet");
+}
+
+function normalizeSearchQuery(text: string): string {
+	const cleaned = text
+		.replace(/^standup-request:\s*/i, "")
+		.replace(/^standup-report:\s*/i, "")
+		.replace(/^continue-task:\s*/i, "")
+		.replace(/^delegate:\s*/i, "")
+		.trim();
+	if (!cleaned) {
+		return "gobierno de Colombia 2026 verificación de noticias falsas y verdaderas";
+	}
+	return cleaned.slice(0, 240);
+}
+
+function formatInternetContext(data: InternetSearchResponse): string {
+	if (!data.results.length) {
+		return `WEB_SEARCH(query=${data.query}, fetchedAt=${data.fetchedAt}): no results.`;
+	}
+
+	const lines = data.results.map((item, index) => {
+		const snippet = item.snippet ? ` | ${item.snippet}` : "";
+		return `${index + 1}. ${item.title} | ${item.url}${snippet}`;
+	});
+
+	return [
+		`WEB_SEARCH(query=${data.query}, fetchedAt=${data.fetchedAt}):`,
+		...lines,
+	].join("\n");
+}
+
+async function gatherInternetContext(message: string): Promise<string> {
+	if (!hasInternetAccess()) {
+		return "";
+	}
+
+	const query = normalizeSearchQuery(message);
+	llmTrace("internet.search.request", { query });
+	const result = (await requestWorkspace("web-search", {
+		query,
+		limit: 5,
+	}).catch((error) => {
+		llmTrace("internet.search.error", { query, error: String(error) });
+		return null;
+	})) as InternetSearchResponse | null;
+
+	if (!result) {
+		return "";
+	}
+
+	llmTrace("internet.search.response", { query: result.query, count: result.results.length });
+	return formatInternetContext(result);
 }
 
 function buildReply(from: string, text: string, recalled: MemoryRecord[]): string {
@@ -168,6 +238,82 @@ function enforceAutonomousResponse(reply: string): string {
 	return updated.join("\n");
 }
 
+function stripStandupPrefix(text: string): string {
+	if (!text.startsWith("standup-report:")) {
+		return text;
+	}
+	return text.replace("standup-report:", "").trim();
+}
+
+type WorkspaceAction =
+	| { kind: "create-file"; relativePath: string; content: string }
+	| { kind: "clone-repo"; repoUrl: string; targetFolder?: string };
+
+function parseWorkspaceActions(reply: string): { cleanedReply: string; actions: WorkspaceAction[] } {
+	const actions: WorkspaceAction[] = [];
+	let cleaned = reply;
+
+	const createFileRegex = /<<CREATE_FILE\s+path="([^"]+)">>([\s\S]*?)<<\/CREATE_FILE>>/g;
+	cleaned = cleaned.replace(createFileRegex, (_match, filePath: string, content: string) => {
+		actions.push({
+			kind: "create-file",
+			relativePath: String(filePath).trim(),
+			content: String(content).replace(/^\n/, "").replace(/\n$/, ""),
+		});
+		return "";
+	});
+
+	const cloneRepoRegex = /<<CLONE_REPO\s+url="([^"]+)"(?:\s+target="([^"]*)")?\s*>><<\/CLONE_REPO>>/g;
+	cleaned = cleaned.replace(cloneRepoRegex, (_match, repoUrl: string, targetFolder?: string) => {
+		actions.push({
+			kind: "clone-repo",
+			repoUrl: String(repoUrl).trim(),
+			targetFolder: String(targetFolder ?? "").trim() || undefined,
+		});
+		return "";
+	});
+
+	cleaned = cleaned.replace(/\n{3,}/g, "\n\n").trim();
+	return { cleanedReply: cleaned, actions };
+}
+
+async function executeWorkspaceActions(actions: WorkspaceAction[]): Promise<string[]> {
+	const results: string[] = [];
+	for (const action of actions) {
+		if (action.kind === "create-file") {
+			const result = await requestWorkspace("create-file", {
+				relativePath: action.relativePath,
+				content: action.content,
+			}).catch((error) => ({ error: String(error) }));
+			const failed = Boolean((result as { error?: string }).error);
+			trace("workspace.create-file", { relativePath: action.relativePath, ok: !failed });
+			results.push(
+				failed
+					? `- create-file ${action.relativePath}: failed (${(result as { error: string }).error})`
+					: `- create-file ${action.relativePath}: ok`,
+			);
+			continue;
+		}
+
+		const result = await requestWorkspace("clone-repo", {
+			repoUrl: action.repoUrl,
+			targetFolder: action.targetFolder ?? "",
+		}).catch((error) => ({ error: String(error) }));
+		const failed = Boolean((result as { error?: string }).error);
+		trace("workspace.clone-repo", {
+			repoUrl: action.repoUrl,
+			targetFolder: action.targetFolder ?? "",
+			ok: !failed,
+		});
+		results.push(
+			failed
+				? `- clone-repo ${action.repoUrl}: failed (${(result as { error: string }).error})`
+				: `- clone-repo ${action.repoUrl}: ok`,
+		);
+	}
+	return results;
+}
+
 async function handleChat(msg: WorkerMessage): Promise<void> {
 	const from = String(msg.from ?? "unknown");
 	const text = String(msg.text ?? "");
@@ -192,6 +338,45 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 		}).catch(() => undefined);
 
 		if (isLeaderAgent()) {
+			currentStandupReports.set(from, stripStandupPrefix(text));
+
+			const standupContext = Array.from(currentStandupReports.entries())
+				.map(([agent, report]) => `- ${agent}: ${report}`)
+				.join("\n");
+
+			let leaderReply = "STATUS: Ongoing standup. FINDINGS: Reports collected. NEXT_ACTIONS: continue investigation and gather stronger evidence. REQUESTS: none";
+			try {
+				const internetContext = await gatherInternetContext(standupContext);
+				const leaderMessage = internetContext
+					? `Standup report received from ${from}. Consolidated reports:\n${standupContext}\n\nUse the following web findings and cite direct URLs in FINDINGS:\n${internetContext}`
+					: `Standup report received from ${from}. Consolidated reports:\n${standupContext}`;
+				leaderReply = await generateAgentReply({
+					agentName: profile.name,
+					systemPrompt: `${profile.systemPrompt}\nYou are the standup leader. Consolidate team progress and produce artifacts when needed.`,
+					mcpAccess: profile.mcpAccess,
+					peers: profile.peers,
+					from,
+					message: leaderMessage,
+					memories: [],
+				});
+			} catch (error) {
+				llmTrace("llm.error", { error: String(error) });
+			}
+
+			leaderReply = enforceAutonomousResponse(leaderReply);
+			const { cleanedReply, actions } = parseWorkspaceActions(leaderReply);
+			const actionResults = await executeWorkspaceActions(actions);
+			const replyWithActionStatus = actionResults.length
+				? `${cleanedReply}\n\nARTIFACT_ACTIONS:\n${actionResults.join("\n")}`
+				: cleanedReply;
+
+			send({
+				type: "chat",
+				from: profile.name,
+				to: "SYSTEM",
+				text: replyWithActionStatus,
+			});
+
 			const nextTask = `continue-task: keep investigating current claims, gather at least 2 fresh sources, and send a new standup-report with updates and contradictions found.`;
 			send({
 				type: "chat",
@@ -206,6 +391,9 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 
 	if (from === "SYSTEM" && text.toLowerCase().includes("standup time")) {
 		trace("standup.start", { peers: profile.peers.length });
+		if (isLeaderAgent()) {
+			currentStandupReports.clear();
+		}
 		for (const peer of profile.peers) {
 			send({
 				type: "chat",
@@ -220,13 +408,17 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 		trace("standup.request_received", { from });
 		let standupReply = "STATUS: Active. FINDINGS: No validated findings yet. NEXT_ACTIONS: gather two sources and summarize contradictions. REQUESTS: none.";
 		try {
+			const internetContext = await gatherInternetContext(text);
+			const messageWithContext = internetContext
+				? `${text}\n\nUse the following web findings and cite direct URLs in FINDINGS:\n${internetContext}`
+				: text;
 			standupReply = await generateAgentReply({
 				agentName: profile.name,
 				systemPrompt: `${profile.systemPrompt}\nYou are responding to a standup request. Be concise and evidence-focused.`,
 				mcpAccess: profile.mcpAccess,
 				peers: profile.peers,
 				from,
-				message: text,
+				message: messageWithContext,
 				memories: recalled.map((item) => item.text),
 			});
 		} catch (error) {
@@ -282,6 +474,10 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 
 	let reply = buildReply(from, text, recalled);
 	try {
+		const internetContext = await gatherInternetContext(text);
+		const messageWithContext = internetContext
+			? `${text}\n\nUse the following web findings and cite direct URLs in FINDINGS:\n${internetContext}`
+			: text;
 		llmTrace("llm.request", { from });
 		reply = await generateAgentReply({
 			agentName: profile.name,
@@ -289,7 +485,7 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 			mcpAccess: profile.mcpAccess,
 			peers: profile.peers,
 			from,
-			message: text,
+			message: messageWithContext,
 			memories: recalled.map((item) => item.text),
 		});
 		llmTrace("llm.response", { length: reply.length });
@@ -302,6 +498,12 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 		llmTrace("llm.error", { error: String(error) });
 		reply = `${reply}\nLLM fallback reason: ${String(error)}`;
 	}
+
+	const { cleanedReply, actions } = parseWorkspaceActions(reply);
+	const actionResults = await executeWorkspaceActions(actions);
+	reply = actionResults.length
+		? `${cleanedReply}\n\nARTIFACT_ACTIONS:\n${actionResults.join("\n")}`
+		: cleanedReply;
 
 	await requestMemory("add", {
 		text: `[OUTGOING] to=${from} text=${reply}`,

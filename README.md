@@ -12,6 +12,7 @@ This project runs a small autonomous "office" where multiple agents collaborate 
 - Lets agents chat with each other and delegate tasks.
 - Stores/retrieves agent memory in ChromaDB.
 - Gives each agent its own workspace directory.
+- Executes real web searches for agents with `internet` MCP access and injects results into replies.
 - Performs startup health checks:
   - ChromaDB connection
   - LLM connectivity
