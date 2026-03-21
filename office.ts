@@ -1,6 +1,7 @@
 import { fork, spawn } from "node:child_process";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import readline from "node:readline";
 import pc from "picocolors";
@@ -171,6 +172,11 @@ function formatAgentName(agentName: string): string {
 	return colorByAgent(agentName)(agentName);
 }
 
+function isPathInside(basePath: string, targetPath: string): boolean {
+	const relative = path.relative(path.resolve(basePath), path.resolve(targetPath));
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 function logLine(icon: string, label: string, message: string): void {
 	const time = pc.dim(`[${formatTimestamp()}]`);
 	const scope = pc.bold(pc.white(`${icon} ${label}`));
@@ -188,22 +194,34 @@ interface OfficeConfig {
 	standupIntervalMinutes: number;
 	standupLeader: string;
 	mainTarget: string;
+	standupOnlyCommunication: boolean;
+	continuousWorkIntervalMinutes: number;
 	mcpServers: Record<MCPServerName, MCPServerConfig>;
 }
+
+type CliOutcome = "continue" | "disconnect" | "shutdown";
 
 class OfficeOrchestrator {
 	private readonly workspaceRoot: string;
 	private readonly agentsDir: string;
 	private readonly workerPath: string;
 	private readonly officeConfigPath: string;
+	private readonly cliSocketPath: string;
 	private readonly runtimes = new Map<string, AgentRuntime>();
+	private readonly recentAgentActivity = new Map<string, string[]>();
+	private readonly attachedCliSockets = new Set<net.Socket>();
+	private cliServer?: net.Server;
 	private standupTimer?: NodeJS.Timeout;
+	private continuousWorkTimer?: NodeJS.Timeout;
+	private isShuttingDown = false;
 	private traceEnabled = (process.env.AGENT_TRACE ?? "1") !== "0";
 	private llmTraceEnabled = (process.env.AGENT_LLM_TRACE ?? "0") === "1";
 	private officeConfig: OfficeConfig = {
 		standupIntervalMinutes: 60,
 		standupLeader: "",
 		mainTarget: "",
+		standupOnlyCommunication: false,
+		continuousWorkIntervalMinutes: 2,
 		mcpServers: {
 			terminal: { enabled: true, description: "Terminal manipulation MCP" },
 			files: { enabled: true, description: "File system MCP" },
@@ -215,6 +233,7 @@ class OfficeOrchestrator {
 		this.workspaceRoot = workspaceRoot;
 		this.agentsDir = path.join(workspaceRoot, "agents");
 		this.officeConfigPath = path.join(workspaceRoot, "office.config.json");
+		this.cliSocketPath = path.join(workspaceRoot, ".office-cli.sock");
 		const tsWorker = path.join(this.agentsDir, "agent-worker.ts");
 		const jsWorker = path.join(this.agentsDir, "agent-worker.js");
 		this.workerPath = fsSync.existsSync(tsWorker) ? tsWorker : jsWorker;
@@ -252,7 +271,309 @@ class OfficeOrchestrator {
 		);
 		this.triggerStandup();
 		this.startStandupLoop();
+		this.startContinuousWorkLoop();
+		await this.startCliServer();
 		this.startCli();
+	}
+
+	private appendAgentActivity(agentName: string, event: string): void {
+		if (!agentName) {
+			return;
+		}
+		const history = this.recentAgentActivity.get(agentName) ?? [];
+		history.push(`[${formatTimestamp()}] ${event}`);
+		if (history.length > 200) {
+			history.splice(0, history.length - 200);
+		}
+		this.recentAgentActivity.set(agentName, history);
+	}
+
+	private getCliHelpText(): string {
+		return [
+			"Commands:",
+			"  help",
+			"  agents",
+			"  agent <name>",
+			"  activity <agent> [limit]",
+			"  mcp",
+			"  trace <on|off>",
+			"  llm-trace <on|off>",
+			"  standup-now",
+			"  work-now",
+			"  chat <fromAgent> <toAgent> <message>",
+			"  ask <agent> <message>      # message from USER to agent",
+			"  memory <agent> <query>",
+			"  exit",
+		].join("\n");
+	}
+
+	private async executeCliCommand(
+		line: string,
+		writer: (text: string) => void,
+		remoteSession: boolean,
+	): Promise<CliOutcome> {
+		const trimmed = line.trim();
+		if (!trimmed) {
+			return "continue";
+		}
+
+		const [command, ...args] = trimmed.split(" ");
+
+		if (command === "help") {
+			writer(this.getCliHelpText());
+			return "continue";
+		}
+
+		if (command === "exit") {
+			return remoteSession ? "disconnect" : "shutdown";
+		}
+
+		if (command === "agents") {
+			for (const runtime of this.runtimes.values()) {
+				writer(
+					`- ${runtime.config.name} | mcp=${runtime.config.mcpAccess.join(",") || "none"} | workspace=${runtime.workspaceRoot}`,
+				);
+			}
+			return "continue";
+		}
+
+		if (command === "agent") {
+			const agentName = String(args[0] ?? "").trim();
+			const runtime = this.runtimes.get(agentName);
+			if (!runtime) {
+				writer("Usage: agent <name>");
+				return "continue";
+			}
+			writer(`name=${runtime.config.name}`);
+			writer(`workspace=${runtime.workspaceRoot}`);
+			writer(`mcp=${runtime.config.mcpAccess.join(",") || "none"}`);
+			writer(`peers=${Array.from(this.runtimes.keys()).filter((name) => name !== runtime.config.name).join(",") || "none"}`);
+			return "continue";
+		}
+
+		if (command === "activity") {
+			const [agentName, limitRaw] = args;
+			const normalizedAgent = String(agentName ?? "").trim();
+			if (!normalizedAgent) {
+				writer("Usage: activity <agent> [limit]");
+				return "continue";
+			}
+			const limit = Math.max(1, Math.min(Number(limitRaw ?? 10) || 10, 100));
+			const history = this.recentAgentActivity.get(normalizedAgent) ?? [];
+			if (!history.length) {
+				writer(`No activity for agent '${normalizedAgent}'`);
+				return "continue";
+			}
+			for (const item of history.slice(-limit)) {
+				writer(item);
+			}
+			return "continue";
+		}
+
+		if (command === "mcp") {
+			writer("MCP servers:");
+			for (const serverName of ["terminal", "files", "internet"] as MCPServerName[]) {
+				const config = this.officeConfig.mcpServers[serverName];
+				writer(`- ${serverName}: ${config.enabled ? "enabled" : "disabled"}${config.description ? ` (${config.description})` : ""}`);
+			}
+			return "continue";
+		}
+
+		if (command === "trace") {
+			const mode = String(args[0] ?? "").toLowerCase();
+			if (mode === "on") {
+				this.traceEnabled = true;
+				writer("Agent traces enabled");
+				return "continue";
+			}
+			if (mode === "off") {
+				this.traceEnabled = false;
+				writer("Agent traces disabled");
+				return "continue";
+			}
+			writer(`Trace is currently ${this.traceEnabled ? "on" : "off"}. Usage: trace <on|off>`);
+			return "continue";
+		}
+
+		if (command === "llm-trace") {
+			const mode = String(args[0] ?? "").toLowerCase();
+			if (mode === "on") {
+				this.llmTraceEnabled = true;
+				for (const runtime of this.runtimes.values()) {
+					runtime.process.send({ type: "config", llmTraceEnabled: true });
+				}
+				writer("LLM traces enabled");
+				return "continue";
+			}
+			if (mode === "off") {
+				this.llmTraceEnabled = false;
+				for (const runtime of this.runtimes.values()) {
+					runtime.process.send({ type: "config", llmTraceEnabled: false });
+				}
+				writer("LLM traces disabled");
+				return "continue";
+			}
+			writer(`LLM trace is currently ${this.llmTraceEnabled ? "on" : "off"}. Usage: llm-trace <on|off>`);
+			return "continue";
+		}
+
+		if (command === "standup-now") {
+			this.triggerStandup();
+			writer("Standup triggered manually");
+			return "continue";
+		}
+
+		if (command === "work-now") {
+			this.triggerContinuousWorkPulse("manual");
+			writer("Continuous work pulse triggered manually");
+			return "continue";
+		}
+
+		if (command === "chat") {
+			const [from, to, ...messageParts] = args;
+			const runtime = this.runtimes.get(from ?? "");
+			if (!runtime || !to || messageParts.length === 0) {
+				writer("Usage: chat <fromAgent> <toAgent> <message>");
+				return "continue";
+			}
+			runtime.process.send({ type: "chat", from: "SYSTEM", text: `delegate:${to} ${messageParts.join(" ")}` });
+			writer(`Delegated from ${from} to ${to}`);
+			return "continue";
+		}
+
+		if (command === "ask") {
+			const [agentName, ...messageParts] = args;
+			const runtime = this.runtimes.get(agentName ?? "");
+			if (!runtime || messageParts.length === 0) {
+				writer("Usage: ask <agent> <message>");
+				return "continue";
+			}
+			runtime.process.send({ type: "chat", from: "USER", text: messageParts.join(" ") });
+			writer(`Question sent to ${agentName}`);
+			return "continue";
+		}
+
+		if (command === "memory") {
+			const [agentName, ...queryParts] = args;
+			const runtime = this.runtimes.get(agentName ?? "");
+			if (!runtime || queryParts.length === 0) {
+				writer("Usage: memory <agent> <query>");
+				return "continue";
+			}
+			const result = await runtime.memory.query(agentName!, queryParts.join(" "), 5);
+			writer(JSON.stringify(result, null, 2));
+			return "continue";
+		}
+
+		writer(this.getCliHelpText());
+		return "continue";
+	}
+
+	private async startCliServer(): Promise<void> {
+		await fs.unlink(this.cliSocketPath).catch((error: NodeJS.ErrnoException) => {
+			if (error?.code !== "ENOENT") {
+				throw error;
+			}
+		});
+
+		this.cliServer = net.createServer((socket) => {
+			this.attachedCliSockets.add(socket);
+			socket.setEncoding("utf8");
+			socket.write("Connected to office CLI. Use 'help' for commands.\n__OFFICE_END__\n");
+			let buffer = "";
+			let chain = Promise.resolve();
+
+			socket.on("close", () => {
+				this.attachedCliSockets.delete(socket);
+			});
+
+			socket.on("error", () => {
+				this.attachedCliSockets.delete(socket);
+			});
+
+			socket.on("data", (chunk) => {
+				buffer += chunk;
+				let newlineIndex = buffer.indexOf("\n");
+				while (newlineIndex >= 0) {
+					const line = buffer.slice(0, newlineIndex).replace(/\r$/, "");
+					buffer = buffer.slice(newlineIndex + 1);
+					chain = chain.then(async () => {
+						const output: string[] = [];
+						const outcome = await this.executeCliCommand(line, (text) => output.push(text), true);
+						if (output.length) {
+							socket.write(`${output.join("\n")}\n`);
+						}
+						socket.write("__OFFICE_END__\n");
+						if (outcome === "disconnect") {
+							socket.end();
+						}
+					});
+					newlineIndex = buffer.indexOf("\n");
+				}
+			});
+		});
+
+		await new Promise<void>((resolve, reject) => {
+			this.cliServer?.once("error", reject);
+			this.cliServer?.listen(this.cliSocketPath, () => {
+				this.cliServer?.off("error", reject);
+				resolve();
+			});
+		});
+
+		logLine("🧩", "cli", `Attach CLI socket ready at ${this.cliSocketPath}`);
+	}
+
+	private broadcastToAttachedCli(message: string): void {
+		if (!this.attachedCliSockets.size || !message.trim()) {
+			return;
+		}
+		for (const socket of this.attachedCliSockets) {
+			if (socket.destroyed) {
+				this.attachedCliSockets.delete(socket);
+				continue;
+			}
+			socket.write(`${message}\n__OFFICE_END__\n`);
+		}
+	}
+
+	private async stopCliServer(): Promise<void> {
+		for (const socket of this.attachedCliSockets) {
+			socket.end();
+		}
+		this.attachedCliSockets.clear();
+
+		await new Promise<void>((resolve) => {
+			if (!this.cliServer) {
+				resolve();
+				return;
+			}
+			this.cliServer.close(() => resolve());
+			this.cliServer = undefined;
+		});
+		await fs.unlink(this.cliSocketPath).catch((error: NodeJS.ErrnoException) => {
+			if (error?.code !== "ENOENT") {
+				console.error(`Failed to remove CLI socket ${this.cliSocketPath}:`, error);
+			}
+		});
+	}
+
+	private async shutdown(): Promise<void> {
+		if (this.isShuttingDown) {
+			return;
+		}
+		this.isShuttingDown = true;
+		if (this.standupTimer) {
+			clearInterval(this.standupTimer);
+		}
+		if (this.continuousWorkTimer) {
+			clearInterval(this.continuousWorkTimer);
+		}
+		for (const runtime of this.runtimes.values()) {
+			runtime.process.kill();
+		}
+		await this.stopCliServer();
+		process.exit(0);
 	}
 
 	private async runStartupChecks(): Promise<void> {
@@ -273,6 +594,10 @@ class OfficeOrchestrator {
 		const standupIntervalMinutes = Number(parsed.standupIntervalMinutes);
 		const standupLeader = String(parsed.standupLeader ?? "").trim();
 		const mainTarget = String(parsed.mainTarget ?? "").trim();
+		const standupOnlyCommunication = Boolean(parsed.standupOnlyCommunication);
+		const continuousWorkIntervalMinutes = parsed.continuousWorkIntervalMinutes == null
+			? 2
+			: Number(parsed.continuousWorkIntervalMinutes);
 		const mcpServers = parsed.mcpServers;
 
 		if (!Number.isFinite(standupIntervalMinutes) || standupIntervalMinutes <= 0) {
@@ -287,6 +612,9 @@ class OfficeOrchestrator {
 		if (!mcpServers) {
 			throw new Error("office.config.json requires mcpServers");
 		}
+		if (!Number.isFinite(continuousWorkIntervalMinutes) || continuousWorkIntervalMinutes <= 0) {
+			throw new Error("office.config.json requires continuousWorkIntervalMinutes > 0 when provided");
+		}
 
 		const validMcp: Record<MCPServerName, MCPServerConfig> = {
 			terminal: { enabled: Boolean(mcpServers.terminal?.enabled), description: mcpServers.terminal?.description },
@@ -298,8 +626,17 @@ class OfficeOrchestrator {
 			standupIntervalMinutes,
 			standupLeader,
 			mainTarget,
+			standupOnlyCommunication,
+			continuousWorkIntervalMinutes,
 			mcpServers: validMcp,
 		};
+	}
+
+	private isStandupScopedAgentMessage(text: string): boolean {
+		const normalized = text.trim().toLowerCase();
+		return normalized.startsWith("standup-request:")
+			|| normalized.startsWith("standup-report:")
+			|| normalized.startsWith("continue-task:");
 	}
 
 	private async loadAgentConfigs(): Promise<AgentConfig[]> {
@@ -354,6 +691,11 @@ class OfficeOrchestrator {
 		const root = configured
 			? path.resolve(this.workspaceRoot, configured)
 			: path.join(this.workspaceRoot, "agent-workspaces", config.name);
+		if (!isPathInside(this.workspaceRoot, root)) {
+			throw new Error(
+				`Invalid workspace.root for agent '${config.name}'. It must be inside the office workspace.`,
+			);
+		}
 		await fs.mkdir(root, { recursive: true });
 		return root;
 	}
@@ -417,6 +759,7 @@ class OfficeOrchestrator {
 
 		if (message.type === "ready") {
 			logLine("✅", "ready", `${formatAgentName(fromAgent)} is online`);
+			this.appendAgentActivity(fromAgent, "ready: online");
 			return;
 		}
 
@@ -427,6 +770,7 @@ class OfficeOrchestrator {
 			const event = String(message.event ?? "event");
 			const details = message.details ? ` ${JSON.stringify(message.details)}` : "";
 			logLine("🔎", `trace:${formatAgentName(fromAgent)}`, `${pc.cyan(event)}${pc.dim(details)}`);
+			this.appendAgentActivity(fromAgent, `trace:${event}${details}`);
 			return;
 		}
 
@@ -437,27 +781,48 @@ class OfficeOrchestrator {
 			const event = String(message.event ?? "event");
 			const details = message.details ? ` ${JSON.stringify(message.details)}` : "";
 			logLine("🧠", `llm:${formatAgentName(fromAgent)}`, `${pc.magenta(event)}${pc.dim(details)}`);
+			this.appendAgentActivity(fromAgent, `llm:${event}${details}`);
 			return;
 		}
 
 		if (message.type === "chat") {
 			const to = String(message.to ?? "");
 			const text = String(message.text ?? "");
+			const preview = text.split("\n")[0];
+			this.appendAgentActivity(fromAgent, `chat->${to || "unknown"}: ${preview}`);
 			if (to === "USER") {
 				logLine("🤖", `agent:${formatAgentName(fromAgent)}`, text);
+				this.broadcastToAttachedCli(`[${formatTimestamp()}] agent:${fromAgent} ${text}`);
 				return;
 			}
 			if (to === "SYSTEM") {
 				logLine("🛰️", `system:${formatAgentName(fromAgent)}`, text);
 				return;
 			}
+
+			if (this.officeConfig.standupOnlyCommunication && !this.isStandupScopedAgentMessage(text)) {
+				const fromRuntime = this.runtimes.get(fromAgent);
+				fromRuntime?.process.send({
+					type: "chat",
+					from: "SYSTEM",
+					text: "Communication blocked: standupOnlyCommunication=true. Agents can only message each other via standup-request, standup-report, or continue-task.",
+				});
+				logLine(
+					"⛔",
+					"chat-blocked",
+					`${formatAgentName(fromAgent)} → ${formatAgentName(to)} blocked by standupOnlyCommunication`,
+				);
+				return;
+			}
+
 			const toRuntime = this.runtimes.get(to);
 			if (!toRuntime) {
 				console.warn(`Chat target not found: ${to}`);
 				return;
 			}
 			toRuntime.process.send({ type: "chat", from: fromAgent, text });
-			logLine("💬", "chat", `${formatAgentName(fromAgent)} → ${formatAgentName(to)}: ${text.split("\n")[0]}`);
+			this.appendAgentActivity(to, `chat<-${fromAgent}: ${preview}`);
+			logLine("💬", "chat", `${formatAgentName(fromAgent)} → ${formatAgentName(to)}: ${preview}`);
 			return;
 		}
 
@@ -695,8 +1060,10 @@ class OfficeOrchestrator {
 		if (!relativePath) {
 			throw new Error("relativePath is required");
 		}
-		const target = path.resolve(workspaceRoot, relativePath);
-		if (!target.startsWith(path.resolve(workspaceRoot))) {
+		const target = path.isAbsolute(relativePath)
+			? path.resolve(relativePath)
+			: path.resolve(workspaceRoot, relativePath);
+		if (!isPathInside(workspaceRoot, target)) {
 			throw new Error("Invalid path outside agent workspace");
 		}
 		await fs.mkdir(path.dirname(target), { recursive: true });
@@ -716,7 +1083,7 @@ class OfficeOrchestrator {
 			? path.resolve(workspaceRoot, targetFolder)
 			: path.resolve(workspaceRoot, path.basename(repoUrl, ".git"));
 
-		if (!destination.startsWith(path.resolve(workspaceRoot))) {
+		if (!isPathInside(workspaceRoot, destination)) {
 			throw new Error("Invalid destination outside agent workspace");
 		}
 
@@ -744,6 +1111,30 @@ class OfficeOrchestrator {
 		}, intervalMs);
 	}
 
+	private startContinuousWorkLoop(): void {
+		this.triggerContinuousWorkPulse("startup");
+		const intervalMs = this.officeConfig.continuousWorkIntervalMinutes * 60 * 1000;
+		this.continuousWorkTimer = setInterval(() => {
+			this.triggerContinuousWorkPulse("interval");
+		}, intervalMs);
+		logLine(
+			"🔁",
+			"work-loop",
+			`Continuous work pulse every ${this.officeConfig.continuousWorkIntervalMinutes} minute(s)`,
+		);
+	}
+
+	private triggerContinuousWorkPulse(reason: "startup" | "interval" | "manual"): void {
+		for (const runtime of this.runtimes.values()) {
+			runtime.process.send({
+				type: "chat",
+				from: "SYSTEM",
+				text: `continue-task: Keep advancing the main target with concrete progress. Main target: ${this.officeConfig.mainTarget}. Report meaningful findings, and when relevant send standup-report updates to ${this.officeConfig.standupLeader}.`,
+			});
+		}
+		logLine("🛠️", "work", `Continuous work pulse sent to ${this.runtimes.size} agent(s) [${reason}]`);
+	}
+
 	private triggerStandup(): void {
 		const leaderRuntime = this.runtimes.get(this.officeConfig.standupLeader);
 		if (!leaderRuntime) {
@@ -767,167 +1158,84 @@ class OfficeOrchestrator {
 			prompt: "office> ",
 		});
 
-		const help = [
-			"Commands:",
-			"  agents",
-			"  mcp",
-			"  trace <on|off>",
-			"  llm-trace <on|off>",
-			"  standup-now",
-			"  chat <fromAgent> <toAgent> <message>",
-			"  ask <agent> <message>      # message from USER to agent",
-			"  memory <agent> <query>",
-			"  exit",
-		].join("\n");
-
-		console.log(help);
+		console.log(this.getCliHelpText());
 		cli.prompt();
 
 		cli.on("line", async (line) => {
-			const trimmed = line.trim();
-			if (!trimmed) {
-				cli.prompt();
-				return;
-			}
-
-			const [command, ...args] = trimmed.split(" ");
-			if (command === "exit") {
+			const outcome = await this.executeCliCommand(line, (text) => console.log(text), false);
+			if (outcome === "shutdown") {
 				cli.close();
 				return;
 			}
-
-			if (command === "agents") {
-				for (const runtime of this.runtimes.values()) {
-					console.log(
-						`- ${runtime.config.name} | mcp=${runtime.config.mcpAccess.join(",") || "none"
-						} | workspace=${runtime.workspaceRoot}`,
-					);
-				}
-				cli.prompt();
-				return;
-			}
-
-			if (command === "mcp") {
-				console.log("MCP servers:");
-				for (const serverName of ["terminal", "files", "internet"] as MCPServerName[]) {
-					const config = this.officeConfig.mcpServers[serverName];
-					console.log(
-						`- ${serverName}: ${config.enabled ? "enabled" : "disabled"}${config.description ? ` (${config.description})` : ""}`,
-					);
-				}
-				cli.prompt();
-				return;
-			}
-
-			if (command === "trace") {
-				const mode = String(args[0] ?? "").toLowerCase();
-				if (mode === "on") {
-					this.traceEnabled = true;
-					console.log("Agent traces enabled");
-					cli.prompt();
-					return;
-				}
-				if (mode === "off") {
-					this.traceEnabled = false;
-					console.log("Agent traces disabled");
-					cli.prompt();
-					return;
-				}
-				console.log(`Trace is currently ${this.traceEnabled ? "on" : "off"}. Usage: trace <on|off>`);
-				cli.prompt();
-				return;
-			}
-
-			if (command === "llm-trace") {
-				const mode = String(args[0] ?? "").toLowerCase();
-				if (mode === "on") {
-					this.llmTraceEnabled = true;
-					for (const runtime of this.runtimes.values()) {
-						runtime.process.send({ type: "config", llmTraceEnabled: true });
-					}
-					console.log("LLM traces enabled");
-					cli.prompt();
-					return;
-				}
-				if (mode === "off") {
-					this.llmTraceEnabled = false;
-					for (const runtime of this.runtimes.values()) {
-						runtime.process.send({ type: "config", llmTraceEnabled: false });
-					}
-					console.log("LLM traces disabled");
-					cli.prompt();
-					return;
-				}
-				console.log(`LLM trace is currently ${this.llmTraceEnabled ? "on" : "off"}. Usage: llm-trace <on|off>`);
-				cli.prompt();
-				return;
-			}
-
-			if (command === "standup-now") {
-				this.triggerStandup();
-				console.log("Standup triggered manually");
-				cli.prompt();
-				return;
-			}
-
-			if (command === "chat") {
-				const [from, to, ...messageParts] = args;
-				const runtime = this.runtimes.get(from ?? "");
-				if (!runtime || !to || messageParts.length === 0) {
-					console.log("Usage: chat <fromAgent> <toAgent> <message>");
-					cli.prompt();
-					return;
-				}
-				runtime.process.send({ type: "chat", from: "SYSTEM", text: `delegate:${to} ${messageParts.join(" ")}` });
-				cli.prompt();
-				return;
-			}
-
-			if (command === "ask") {
-				const [agentName, ...messageParts] = args;
-				const runtime = this.runtimes.get(agentName ?? "");
-				if (!runtime || messageParts.length === 0) {
-					console.log("Usage: ask <agent> <message>");
-					cli.prompt();
-					return;
-				}
-				runtime.process.send({ type: "chat", from: "USER", text: messageParts.join(" ") });
-				cli.prompt();
-				return;
-			}
-
-			if (command === "memory") {
-				const [agentName, ...queryParts] = args;
-				const runtime = this.runtimes.get(agentName ?? "");
-				if (!runtime || queryParts.length === 0) {
-					console.log("Usage: memory <agent> <query>");
-					cli.prompt();
-					return;
-				}
-				const result = await runtime.memory.query(agentName!, queryParts.join(" "), 5);
-				console.log(result);
-				cli.prompt();
-				return;
-			}
-
-			console.log(help);
 			cli.prompt();
 		});
 
-		cli.on("close", () => {
-			if (this.standupTimer) {
-				clearInterval(this.standupTimer);
-			}
-			for (const runtime of this.runtimes.values()) {
-				runtime.process.kill();
-			}
-			process.exit(0);
+		cli.on("close", async () => {
+			await this.shutdown();
 		});
 	}
 }
 
+async function runAttachCliClient(workspaceRoot: string): Promise<void> {
+	const socketPath = path.join(workspaceRoot, ".office-cli.sock");
+	const socket = net.createConnection(socketPath);
+	const cli = readline.createInterface({
+		input: process.stdin,
+		output: process.stdout,
+		prompt: "office(remote)> ",
+	});
+
+	let buffer = "";
+
+	socket.setEncoding("utf8");
+	socket.on("connect", () => {
+		cli.prompt();
+	});
+
+	socket.on("data", (chunk) => {
+		buffer += chunk;
+		let newlineIndex = buffer.indexOf("\n");
+		while (newlineIndex >= 0) {
+			const line = buffer.slice(0, newlineIndex).replace(/\r$/, "");
+			buffer = buffer.slice(newlineIndex + 1);
+			if (line === "__OFFICE_END__") {
+				cli.prompt();
+			} else if (line.trim()) {
+				console.log(line);
+			}
+			newlineIndex = buffer.indexOf("\n");
+		}
+	});
+
+	socket.on("error", (error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") {
+			console.error(`Office CLI socket not found at ${socketPath}. Start office first.`);
+		} else {
+			console.error("Failed to connect to office CLI socket:", error);
+		}
+		process.exit(1);
+	});
+
+	socket.on("close", () => {
+		console.log("Detached from office CLI");
+		process.exit(0);
+	});
+
+	cli.on("line", (line) => {
+		socket.write(`${line}\n`);
+	});
+
+	cli.on("close", () => {
+		socket.end();
+	});
+}
+
 async function main() {
 	const workspaceRoot = __dirname;
+	if (process.argv.includes("--attach-cli")) {
+		await runAttachCliClient(workspaceRoot);
+		return;
+	}
 	const office = new OfficeOrchestrator(workspaceRoot);
 	await office.boot();
 }

@@ -30,7 +30,7 @@ loadEnvironment();
 
 const GROQ_TOKEN = (process.env.GROQ_API_KEY ?? "").trim();
 const OLLAMA_HOST = process.env.OLLAMA_HOST ?? "http://localhost:11434";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "qwen3:8b";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "deepseek-r1:14b";
 const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
 const GROQ_MODELS = [
 	"openai/gpt-oss-120b",
@@ -54,6 +54,84 @@ const parseErrorMessage = (error: unknown): string => {
 		return error.message;
 	}
 	return String(error);
+};
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => {
+	setTimeout(resolve, ms);
+});
+
+const getHeaderValue = (headers: unknown, headerName: string): string | undefined => {
+	if (!headers || typeof headers !== "object") {
+		return undefined;
+	}
+
+	const normalized = headerName.toLowerCase();
+	const maybeHeaders = headers as { get?: (name: string) => string | null };
+	if (typeof maybeHeaders.get === "function") {
+		const value = maybeHeaders.get(headerName) ?? maybeHeaders.get(normalized);
+		return value ?? undefined;
+	}
+
+	const record = headers as Record<string, unknown>;
+	for (const [key, value] of Object.entries(record)) {
+		if (key.toLowerCase() === normalized && typeof value === "string") {
+			return value;
+		}
+	}
+
+	return undefined;
+};
+
+const parseRetryAfterMs = (error: unknown): number | undefined => {
+	const value = error as {
+		headers?: unknown;
+		response?: { headers?: unknown };
+	};
+
+	const retryAfterHeader = getHeaderValue(value.headers, "retry-after")
+		?? getHeaderValue(value.response?.headers, "retry-after");
+
+	if (retryAfterHeader) {
+		const seconds = Number(retryAfterHeader);
+		if (Number.isFinite(seconds) && seconds > 0) {
+			return Math.ceil(seconds * 1000);
+		}
+
+		const retryAtEpoch = Date.parse(retryAfterHeader);
+		if (Number.isFinite(retryAtEpoch)) {
+			const ms = retryAtEpoch - Date.now();
+			if (ms > 0) {
+				return ms;
+			}
+		}
+	}
+
+	const message = parseErrorMessage(error);
+	const secondPatterns = [
+		/try again in\s+(\d+(?:\.\d+)?)\s*s/i,
+		/retry after\s+(\d+(?:\.\d+)?)\s*s/i,
+		/wait\s+(\d+(?:\.\d+)?)\s*seconds?/i,
+	];
+	for (const pattern of secondPatterns) {
+		const match = message.match(pattern);
+		if (!match) {
+			continue;
+		}
+		const seconds = Number(match[1]);
+		if (Number.isFinite(seconds) && seconds > 0) {
+			return Math.ceil(seconds * 1000);
+		}
+	}
+
+	const msMatch = message.match(/(\d+)\s*ms/i);
+	if (msMatch) {
+		const ms = Number(msMatch[1]);
+		if (Number.isFinite(ms) && ms > 0) {
+			return ms;
+		}
+	}
+
+	return undefined;
 };
 
 const isModelUnavailableError = (error: unknown): boolean => {
@@ -107,24 +185,40 @@ const fetchGroq = async (messages: LlmMessage[]): Promise<string> => {
 
 	const input = toGroqInput(messages);
 	const errorsByModel: string[] = [];
+	const maxRounds = 3;
 
-	for (const model of GROQ_MODELS) {
-		try {
-			const response = await groqClient.responses.create({
-				model,
-				input,
-			});
-			const outputText = response.output_text?.trim() ?? "";
-			if (outputText) {
-				return outputText;
+	for (let round = 1; round <= maxRounds; round += 1) {
+		let retryAfterMs = 0;
+
+		for (const model of GROQ_MODELS) {
+			try {
+				const response = await groqClient.responses.create({
+					model,
+					input,
+				});
+				const outputText = response.output_text?.trim() ?? "";
+				if (outputText) {
+					return outputText;
+				}
+				errorsByModel.push(`[round ${round}] ${model}: empty response`);
+			} catch (error) {
+				const message = parseErrorMessage(error);
+				errorsByModel.push(`[round ${round}] ${model}: ${message}`);
+
+				if (isModelUnavailableError(error)) {
+					continue;
+				}
+
+				const suggestedRetryAfter = parseRetryAfterMs(error);
+				if (suggestedRetryAfter && suggestedRetryAfter > retryAfterMs) {
+					retryAfterMs = suggestedRetryAfter;
+				}
 			}
-			errorsByModel.push(`${model}: empty response`);
-		} catch (error) {
-			const message = parseErrorMessage(error);
-			errorsByModel.push(`${model}: ${message}`);
-			if (!isModelUnavailableError(error)) {
-				throw new Error(`Groq request failed on model ${model}: ${message}`);
-			}
+		}
+
+		if (retryAfterMs > 0 && round < maxRounds) {
+			logger.warn(`Groq rate-limited/temporary error. Retrying all models in ${retryAfterMs}ms`);
+			await sleep(retryAfterMs);
 		}
 	}
 
@@ -146,6 +240,7 @@ export interface AgentReplyInput {
 	from: string;
 	message: string;
 	memories: string[];
+	responseStyle?: "structured" | "natural";
 }
 
 export const checkLlmConnection = async (): Promise<void> => {
@@ -185,6 +280,23 @@ export const generateAgentReply = async (input: AgentReplyInput): Promise<string
 	assertModelConfig();
 
 	const mainTargetHint = `Project root: ${PROJECT_ROOT}`;
+	const responseStyle = input.responseStyle ?? "structured";
+	const responseGuidance = responseStyle === "natural"
+		? [
+			"Respond in natural conversational text.",
+			"Do not use STATUS/FINDINGS/NEXT_ACTIONS/DELEGATIONS/REQUESTS sections unless explicitly requested.",
+			"Keep the answer clear, direct, and practical.",
+		]
+		: [
+			"If internet access is available and web findings are provided in the message, you must use them and include explicit source URLs in FINDINGS.",
+			"Response format is mandatory:",
+			"1) STATUS: one-sentence current status",
+			"2) FINDINGS: 1-3 concrete findings or assumptions",
+			"3) NEXT_ACTIONS: at least 2 explicit actions you will execute now",
+			"4) DELEGATIONS: optional, include exact peer names and what they should do",
+			"5) REQUESTS: must be 'none' unless a hard technical blocker exists",
+		];
+
 	const system = [
 		input.systemPrompt,
 		`You are agent: ${input.agentName}`,
@@ -197,13 +309,7 @@ export const generateAgentReply = async (input: AgentReplyInput): Promise<string
 		"If information is incomplete, make explicit assumptions and continue execution.",
 		"Do not answer with generic status phrases like 'everything is good' or 'ready to help'.",
 		"Always provide concrete next steps and who should do them.",
-		"If internet access is available and web findings are provided in the message, you must use them and include explicit source URLs in FINDINGS.",
-		"Response format is mandatory:",
-		"1) STATUS: one-sentence current status",
-		"2) FINDINGS: 1-3 concrete findings or assumptions",
-		"3) NEXT_ACTIONS: at least 2 explicit actions you will execute now",
-		"4) DELEGATIONS: optional, include exact peer names and what they should do",
-		"5) REQUESTS: must be 'none' unless a hard technical blocker exists",
+		...responseGuidance,
 		"If you must create files, append one or more blocks exactly in this format:",
 		"<<CREATE_FILE path=\"relative/path.ext\">>",
 		"file content",

@@ -1,4 +1,5 @@
 import { generateAgentReply } from "../llm";
+import path from "node:path";
 
 interface AgentProfile {
 	name: string;
@@ -249,6 +250,30 @@ type WorkspaceAction =
 	| { kind: "create-file"; relativePath: string; content: string }
 	| { kind: "clone-repo"; repoUrl: string; targetFolder?: string };
 
+function sanitizeWorkspaceRelativePath(rawPath: string): string {
+	let cleaned = String(rawPath ?? "").trim();
+	if (!cleaned) {
+		return "artifact.md";
+	}
+
+	cleaned = cleaned.replace(/\\/g, "/");
+
+	if (path.isAbsolute(cleaned) || /^[a-zA-Z]:\//.test(cleaned)) {
+		const base = path.posix.basename(cleaned);
+		return base || "artifact.md";
+	}
+
+	let normalized = path.posix.normalize(cleaned);
+	while (normalized.startsWith("../")) {
+		normalized = normalized.slice(3);
+	}
+	normalized = normalized.replace(/^\.\//, "");
+	if (!normalized || normalized === "." || normalized === "..") {
+		return "artifact.md";
+	}
+	return normalized;
+}
+
 function parseWorkspaceActions(reply: string): { cleanedReply: string; actions: WorkspaceAction[] } {
 	const actions: WorkspaceAction[] = [];
 	let cleaned = reply;
@@ -257,8 +282,18 @@ function parseWorkspaceActions(reply: string): { cleanedReply: string; actions: 
 	cleaned = cleaned.replace(createFileRegex, (_match, filePath: string, content: string) => {
 		actions.push({
 			kind: "create-file",
-			relativePath: String(filePath).trim(),
+			relativePath: sanitizeWorkspaceRelativePath(String(filePath).trim()),
 			content: String(content).replace(/^\n/, "").replace(/\n$/, ""),
+		});
+		return "";
+	});
+
+	const createFileSingleTagRegex = /<<CREATE_FILE\s+path="([^"]+)"(?:\s+content="([\s\S]*?)")?\s*>>?/g;
+	cleaned = cleaned.replace(createFileSingleTagRegex, (_match, filePath: string, content?: string) => {
+		actions.push({
+			kind: "create-file",
+			relativePath: sanitizeWorkspaceRelativePath(String(filePath).trim()),
+			content: String(content ?? ""),
 		});
 		return "";
 	});
@@ -473,6 +508,7 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 	}
 
 	let reply = buildReply(from, text, recalled);
+	const wantsNaturalReply = from === "USER";
 	try {
 		const internetContext = await gatherInternetContext(text);
 		const messageWithContext = internetContext
@@ -487,13 +523,16 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 			from,
 			message: messageWithContext,
 			memories: recalled.map((item) => item.text),
+			responseStyle: wantsNaturalReply ? "natural" : "structured",
 		});
 		llmTrace("llm.response", { length: reply.length });
-		if (isPassiveReply(reply)) {
+		if (!wantsNaturalReply && isPassiveReply(reply)) {
 			reply = buildProactiveRewrite(from, text, recalled);
 			llmTrace("llm.rewritten_proactive", { reason: "passive_reply_detected" });
 		}
-		reply = enforceAutonomousResponse(reply);
+		if (!wantsNaturalReply) {
+			reply = enforceAutonomousResponse(reply);
+		}
 	} catch (error) {
 		llmTrace("llm.error", { error: String(error) });
 		reply = `${reply}\nLLM fallback reason: ${String(error)}`;

@@ -6,6 +6,7 @@
   "scripts": {
     "start": "if lsof -iTCP:8000 -sTCP:LISTEN -n -P >/dev/null; then echo 'Using existing Chroma server on localhost:8000'; else npx chroma run --path ./chroma-db & fi; until curl -sf http://localhost:8000/api/v2/heartbeat > /dev/null; do sleep 1; done; tsx office.ts",
     "start:with-no-chroma": "tsx office.ts",
+    "cli:attach": "tsx office.ts --attach-cli",
     "chroma:run": "npx chroma run --path ./chroma-db",
     "build": "tsc -p tsconfig.json",
     "test": "echo \"No tests configured\""
