@@ -226,6 +226,50 @@ function isLeaderAgent(): boolean {
 	return profile.name.toLowerCase().includes("redactor");
 }
 
+function inferAssignedRole(agentName: string): string {
+	const normalized = agentName.toLowerCase();
+	if (normalized.includes("nexus")) {
+		return "Product Owner";
+	}
+	if (normalized.includes("buffer")) {
+		return "Tech Lead / Arquitecto";
+	}
+	if (normalized.includes("link")) {
+		return "Desarrollador";
+	}
+	if (normalized.includes("sentry")) {
+		return "QA Engineer";
+	}
+	return "Contributor";
+}
+
+async function shouldRunPlanningStandup(): Promise<boolean> {
+	const recalled = (await requestMemory("query", {
+		query: "[PLANNING_STANDUP] [STANDUP_REPORT] standup-report",
+		limit: 1,
+	}).catch(() => [])) as MemoryRecord[];
+	return recalled.length === 0;
+}
+
+function buildStandupRequest(peer: string, planningMode: boolean): string {
+	if (!planningMode) {
+		return "standup-request: send your latest update, including progress, blockers, and next steps.";
+	}
+
+	const assignedRole = inferAssignedRole(peer);
+	return [
+		"standup-request: planning-mode (first standup detected, no prior standup memory).",
+		`Assigned role for this cycle: ${assignedRole}.`,
+		"Submit a planning report with:",
+		"1) ROLE_CONFIRMATION",
+		"2) PHASED_PLAN (small incremental deliverables)",
+		"3) DEPENDENCIES (who/what you need)",
+		"4) WAIT_STATUS (can_start_now=yes/no)",
+		"5) NEXT_STEP once dependency is resolved.",
+		"If blocked by dependency, explicitly mark WAIT_STATUS=no and include WAIT_FOR=<dependency>."
+	].join(" ");
+}
+
 function enforceAutonomousResponse(reply: string): string {
 	const lines = reply.split("\n");
 	let hasRequestsLine = false;
@@ -640,6 +684,13 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 
 	if (from === "SYSTEM" && text.toLowerCase().includes("standup time")) {
 		trace("standup.start", { peers: profile.peers.length });
+		const planningMode = await shouldRunPlanningStandup();
+		if (planningMode) {
+			await requestMemory("add", {
+				text: `[PLANNING_STANDUP] initiated by=${profile.name} peers=${profile.peers.join(",")}`,
+				metadata: { direction: "planning", by: profile.name },
+			}).catch(() => undefined);
+		}
 		if (isLeaderAgent()) {
 			currentStandupReports.clear();
 		}
@@ -648,9 +699,26 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 				type: "chat",
 				from: profile.name,
 				to: peer,
-				text: "standup-request: send your latest update, including progress, blockers, and next steps.",
+				text: buildStandupRequest(peer, planningMode),
 			});
 		}
+		return;
+	}
+
+	if (/^(wait-for|dependency-wait):/i.test(text)) {
+		const dependency = text.replace(/^(wait-for|dependency-wait):/i, "").trim() || "unspecified dependency";
+		await requestMemory("add", {
+			text: `[DEPENDENCY_WAIT] agent=${profile.name} waiting_for=${dependency}`,
+			metadata: { direction: "dependency_wait", dependency, from },
+		}).catch(() => undefined);
+
+		send({
+			type: "chat",
+			from: profile.name,
+			to: from,
+			text: `STATUS: waiting. WAIT_FOR: ${dependency}. NEXT_ACTIONS: monitor dependency and resume immediately when unblocked. REQUESTS: none`,
+		});
+		trace("dependency.wait_set", { from, dependency });
 		return;
 	}
 
