@@ -316,6 +316,17 @@ export const generateAgentReply = async (input: AgentReplyInput): Promise<string
 		"<</CREATE_FILE>>",
 		"If you must clone a repository, append:",
 		"<<CLONE_REPO url=\"https://repo.git\" target=\"optional-folder\">><</CLONE_REPO>>",
+		"If you must commit, append:",
+		"<<GIT_COMMIT repo=\".\" message=\"feat: update docs\" add_all=\"true\">><</GIT_COMMIT>>",
+		"If you must push, append:",
+		"<<GIT_PUSH repo=\".\" remote=\"origin\" branch=\"feature/my-branch\">><</GIT_PUSH>>",
+		"If you must create a pull request, append:",
+		"<<PR_CREATE repo=\".\" title=\"My PR\" body=\"summary\" base=\"main\" head=\"feature/my-branch\" draft=\"false\">><</PR_CREATE>>",
+		"If you must approve a pull request, append:",
+		"<<PR_APPROVE repo=\".\" number=\"123\" body=\"Looks good\">><</PR_APPROVE>>",
+		"If you must wait, append one of these blocks:",
+		"<<WAIT seconds=\"30\">><</WAIT>>",
+		"<<WAIT until=\"message\">><</WAIT>>",
 		"Keep answers concise and action-oriented.",
 	].join("\n");
 

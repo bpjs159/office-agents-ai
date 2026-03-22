@@ -1,9 +1,7 @@
 {
-  "standupIntervalMinutes": 5,
-  "continuousWorkIntervalMinutes": 2,
-  "standupLeader": "pedro-redactor",
-  "standupOnlyCommunication": true,
-  "mainTarget": "Un equipo de investigación encargado de buscar noticias falsas del gobierno de Colombia para el año 2026, desmentirlas con datos reales y verificar también las noticias verdaderas. Pedro debe generar informes en markdown en cada standup, incluyendo las noticias investigadas con sus respectivas fuentes.",
+  "standupIntervalMinutes": 60,
+  "standupLeader": "nexus",
+  "mainTarget": "Construir una aplicación web con Vite y React enfocada en edición completa de archivos CSV y texto plano, con un enfoque fuerte en UI/UX usando Tailwind CSS. La implementación debe usar como base la repo https://github.com/bpjs159/file-text-editor.git. Debe incluir muchas herramientas: importación múltiple (drag & drop), previsualización inteligente, edición por celdas y por lotes, búsqueda avanzada, filtros combinados, ordenamiento multinivel, deduplicación, validación de tipos, limpieza de datos, reemplazos masivos, transformaciones con reglas, operaciones por columnas, mapeo y renombrado de headers, unión/merge/split de archivos, paginación virtual, historial de cambios con undo/redo, guardado automático, comparación de versiones, exportación a múltiples formatos y perfiles de transformación reutilizables. La UX debe priorizar claridad, velocidad y accesibilidad: layout limpio, feedback inmediato, estados de carga/progreso, atajos de teclado, componentes consistentes y diseño responsive con Tailwind. La prioridad principal es el rendimiento extremo: tiempos de carga rápidos, parsing y procesamiento en streaming/chunks, uso de Web Workers, virtualización de filas/columnas, indexación eficiente, manejo de memoria optimizado y estrategias de backpressure para soportar carga y transformación de archivos con más de 20 millones de registros sin bloquear la interfaz. Además, el desarrollo debe seguir estándares de seguridad y calidad: validación estricta de entrada, sanitización de contenido, prevención de XSS e inyección de fórmulas CSV, control de tamaño y tipo de archivo, manejo seguro de errores sin exponer datos sensibles, análisis de dependencias y vulnerabilidades, y políticas claras de privacidad de datos. También debe incluir excelencia de ingeniería: TypeScript estricto, arquitectura modular, linting y formateo automáticos, documentación técnica y de usuario, pruebas unitarias, de integración y end-to-end con cobertura mínima definida para flujos críticos, pruebas de rendimiento y estrés para datasets masivos, observabilidad con métricas y logging estructurado, revisiones de código obligatorias y definición de criterios de aceptación medibles por funcionalidad.",
   "mcpServers": {
     "terminal": {
       "enabled": true,
@@ -16,6 +14,10 @@
     "internet": {
       "enabled": true,
       "description": "MCP server for internet access"
+    },
+    "wait": {
+      "enabled": true,
+      "description": "MCP server for timed wait and wait-until-message"
     }
   }
 }

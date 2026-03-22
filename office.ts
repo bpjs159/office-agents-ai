@@ -22,7 +22,7 @@ interface AgentConfig {
 	};
 }
 
-type MCPServerName = "terminal" | "files" | "internet";
+type MCPServerName = "terminal" | "files" | "internet" | "wait";
 
 interface MCPServerConfig {
 	enabled: boolean;
@@ -194,9 +194,13 @@ interface OfficeConfig {
 	standupIntervalMinutes: number;
 	standupLeader: string;
 	mainTarget: string;
-	standupOnlyCommunication: boolean;
-	continuousWorkIntervalMinutes: number;
 	mcpServers: Record<MCPServerName, MCPServerConfig>;
+}
+
+interface PendingMessageWait {
+	requestId: string;
+	runtime: AgentRuntime;
+	createdAt: string;
 }
 
 type CliOutcome = "continue" | "disconnect" | "shutdown";
@@ -210,9 +214,9 @@ class OfficeOrchestrator {
 	private readonly runtimes = new Map<string, AgentRuntime>();
 	private readonly recentAgentActivity = new Map<string, string[]>();
 	private readonly attachedCliSockets = new Set<net.Socket>();
+	private readonly pendingMessageWaits = new Map<string, PendingMessageWait[]>();
 	private cliServer?: net.Server;
 	private standupTimer?: NodeJS.Timeout;
-	private continuousWorkTimer?: NodeJS.Timeout;
 	private isShuttingDown = false;
 	private traceEnabled = (process.env.AGENT_TRACE ?? "1") !== "0";
 	private llmTraceEnabled = (process.env.AGENT_LLM_TRACE ?? "0") === "1";
@@ -220,12 +224,11 @@ class OfficeOrchestrator {
 		standupIntervalMinutes: 60,
 		standupLeader: "",
 		mainTarget: "",
-		standupOnlyCommunication: false,
-		continuousWorkIntervalMinutes: 2,
 		mcpServers: {
 			terminal: { enabled: true, description: "Terminal manipulation MCP" },
 			files: { enabled: true, description: "File system MCP" },
 			internet: { enabled: true, description: "Internet access MCP" },
+			wait: { enabled: true, description: "Wait/scheduling MCP" },
 		},
 	};
 
@@ -271,7 +274,6 @@ class OfficeOrchestrator {
 		);
 		this.triggerStandup();
 		this.startStandupLoop();
-		this.startContinuousWorkLoop();
 		await this.startCliServer();
 		this.startCli();
 	}
@@ -288,6 +290,38 @@ class OfficeOrchestrator {
 		this.recentAgentActivity.set(agentName, history);
 	}
 
+	private registerWaitUntilMessage(agentName: string, runtime: AgentRuntime, requestId: string): void {
+		const items = this.pendingMessageWaits.get(agentName) ?? [];
+		items.push({
+			requestId,
+			runtime,
+			createdAt: new Date().toISOString(),
+		});
+		this.pendingMessageWaits.set(agentName, items);
+	}
+
+	private resolveWaitUntilMessage(agentName: string, wakeSource: "USER" | "AGENT", from: string): void {
+		const waiters = this.pendingMessageWaits.get(agentName) ?? [];
+		if (!waiters.length) {
+			return;
+		}
+		this.pendingMessageWaits.delete(agentName);
+		for (const waiter of waiters) {
+			waiter.runtime.process.send({
+				type: "workspace-result",
+				requestId: waiter.requestId,
+				data: {
+					mode: "until-message",
+					status: "woken",
+					wakeSource,
+					from,
+					waitStartedAt: waiter.createdAt,
+					wokeAt: new Date().toISOString(),
+				},
+			});
+		}
+	}
+
 	private getCliHelpText(): string {
 		return [
 			"Commands:",
@@ -299,7 +333,6 @@ class OfficeOrchestrator {
 			"  trace <on|off>",
 			"  llm-trace <on|off>",
 			"  standup-now",
-			"  work-now",
 			"  chat <fromAgent> <toAgent> <message>",
 			"  ask <agent> <message>      # message from USER to agent",
 			"  memory <agent> <query>",
@@ -372,7 +405,7 @@ class OfficeOrchestrator {
 
 		if (command === "mcp") {
 			writer("MCP servers:");
-			for (const serverName of ["terminal", "files", "internet"] as MCPServerName[]) {
+			for (const serverName of ["terminal", "files", "internet", "wait"] as MCPServerName[]) {
 				const config = this.officeConfig.mcpServers[serverName];
 				writer(`- ${serverName}: ${config.enabled ? "enabled" : "disabled"}${config.description ? ` (${config.description})` : ""}`);
 			}
@@ -423,12 +456,6 @@ class OfficeOrchestrator {
 			return "continue";
 		}
 
-		if (command === "work-now") {
-			this.triggerContinuousWorkPulse("manual");
-			writer("Continuous work pulse triggered manually");
-			return "continue";
-		}
-
 		if (command === "chat") {
 			const [from, to, ...messageParts] = args;
 			const runtime = this.runtimes.get(from ?? "");
@@ -449,6 +476,7 @@ class OfficeOrchestrator {
 				return "continue";
 			}
 			runtime.process.send({ type: "chat", from: "USER", text: messageParts.join(" ") });
+			this.resolveWaitUntilMessage(String(agentName), "USER", "USER");
 			writer(`Question sent to ${agentName}`);
 			return "continue";
 		}
@@ -566,9 +594,6 @@ class OfficeOrchestrator {
 		if (this.standupTimer) {
 			clearInterval(this.standupTimer);
 		}
-		if (this.continuousWorkTimer) {
-			clearInterval(this.continuousWorkTimer);
-		}
 		for (const runtime of this.runtimes.values()) {
 			runtime.process.kill();
 		}
@@ -594,10 +619,6 @@ class OfficeOrchestrator {
 		const standupIntervalMinutes = Number(parsed.standupIntervalMinutes);
 		const standupLeader = String(parsed.standupLeader ?? "").trim();
 		const mainTarget = String(parsed.mainTarget ?? "").trim();
-		const standupOnlyCommunication = Boolean(parsed.standupOnlyCommunication);
-		const continuousWorkIntervalMinutes = parsed.continuousWorkIntervalMinutes == null
-			? 2
-			: Number(parsed.continuousWorkIntervalMinutes);
 		const mcpServers = parsed.mcpServers;
 
 		if (!Number.isFinite(standupIntervalMinutes) || standupIntervalMinutes <= 0) {
@@ -612,31 +633,23 @@ class OfficeOrchestrator {
 		if (!mcpServers) {
 			throw new Error("office.config.json requires mcpServers");
 		}
-		if (!Number.isFinite(continuousWorkIntervalMinutes) || continuousWorkIntervalMinutes <= 0) {
-			throw new Error("office.config.json requires continuousWorkIntervalMinutes > 0 when provided");
-		}
 
 		const validMcp: Record<MCPServerName, MCPServerConfig> = {
 			terminal: { enabled: Boolean(mcpServers.terminal?.enabled), description: mcpServers.terminal?.description },
 			files: { enabled: Boolean(mcpServers.files?.enabled), description: mcpServers.files?.description },
 			internet: { enabled: Boolean(mcpServers.internet?.enabled), description: mcpServers.internet?.description },
+			wait: {
+				enabled: mcpServers.wait?.enabled == null ? true : Boolean(mcpServers.wait?.enabled),
+				description: mcpServers.wait?.description,
+			},
 		};
 
 		return {
 			standupIntervalMinutes,
 			standupLeader,
 			mainTarget,
-			standupOnlyCommunication,
-			continuousWorkIntervalMinutes,
 			mcpServers: validMcp,
 		};
-	}
-
-	private isStandupScopedAgentMessage(text: string): boolean {
-		const normalized = text.trim().toLowerCase();
-		return normalized.startsWith("standup-request:")
-			|| normalized.startsWith("standup-report:")
-			|| normalized.startsWith("continue-task:");
 	}
 
 	private async loadAgentConfigs(): Promise<AgentConfig[]> {
@@ -646,7 +659,7 @@ class OfficeOrchestrator {
 			.map((entry) => path.join(this.agentsDir, entry.name));
 
 		const configs: AgentConfig[] = [];
-		const allowedServers: MCPServerName[] = ["terminal", "files", "internet"];
+		const allowedServers: MCPServerName[] = ["terminal", "files", "internet", "wait"];
 		for (const filePath of jsonFiles) {
 			const raw = await fs.readFile(filePath, "utf8");
 			const parsed = JSON.parse(raw) as AgentConfig;
@@ -727,6 +740,7 @@ class OfficeOrchestrator {
 
 		child.on("exit", (code, signal) => {
 			console.log(`Agent ${config.name} exited (code=${code} signal=${signal ?? "none"})`);
+			this.pendingMessageWaits.delete(config.name);
 			this.runtimes.delete(config.name);
 		});
 
@@ -800,27 +814,13 @@ class OfficeOrchestrator {
 				return;
 			}
 
-			if (this.officeConfig.standupOnlyCommunication && !this.isStandupScopedAgentMessage(text)) {
-				const fromRuntime = this.runtimes.get(fromAgent);
-				fromRuntime?.process.send({
-					type: "chat",
-					from: "SYSTEM",
-					text: "Communication blocked: standupOnlyCommunication=true. Agents can only message each other via standup-request, standup-report, or continue-task.",
-				});
-				logLine(
-					"⛔",
-					"chat-blocked",
-					`${formatAgentName(fromAgent)} → ${formatAgentName(to)} blocked by standupOnlyCommunication`,
-				);
-				return;
-			}
-
 			const toRuntime = this.runtimes.get(to);
 			if (!toRuntime) {
 				console.warn(`Chat target not found: ${to}`);
 				return;
 			}
 			toRuntime.process.send({ type: "chat", from: fromAgent, text });
+			this.resolveWaitUntilMessage(to, "AGENT", fromAgent);
 			this.appendAgentActivity(to, `chat<-${fromAgent}: ${preview}`);
 			logLine("💬", "chat", `${formatAgentName(fromAgent)} → ${formatAgentName(to)}: ${preview}`);
 			return;
@@ -865,6 +865,52 @@ class OfficeOrchestrator {
 			const op = String(message.op ?? "");
 			const payload = (message.payload ?? {}) as Record<string, unknown>;
 			try {
+				if (op === "wait") {
+					if (!this.hasMcpAccess(fromAgent, "wait")) {
+						runtime.process.send({
+							type: "workspace-result",
+							requestId,
+							error: "MCP access denied: wait",
+						});
+						return;
+					}
+
+					const mode = String(payload.mode ?? "").trim().toLowerCase();
+					const untilMessage = payload.untilMessage === true || mode === "until-message" || mode === "message";
+
+					if (untilMessage) {
+						this.registerWaitUntilMessage(fromAgent, runtime, requestId);
+						return;
+					}
+
+					const seconds = Number(payload.seconds ?? payload.durationSeconds ?? 0);
+					if (!Number.isFinite(seconds) || seconds <= 0) {
+						runtime.process.send({
+							type: "workspace-result",
+							requestId,
+							error: "wait requires seconds > 0 or mode=until-message",
+						});
+						return;
+					}
+
+					const waitMs = Math.round(seconds * 1000);
+					await new Promise<void>((resolve) => {
+						setTimeout(resolve, waitMs);
+					});
+
+					runtime.process.send({
+						type: "workspace-result",
+						requestId,
+						data: {
+							mode: "seconds",
+							status: "elapsed",
+							waitedSeconds: seconds,
+							waitedMs: waitMs,
+						},
+					});
+					return;
+				}
+
 				if (op === "web-search") {
 					if (!this.hasMcpAccess(fromAgent, "internet")) {
 						runtime.process.send({
@@ -911,6 +957,82 @@ class OfficeOrchestrator {
 						runtime.workspaceRoot,
 						String(payload.repoUrl ?? ""),
 						String(payload.targetFolder ?? ""),
+					);
+					runtime.process.send({ type: "workspace-result", requestId, data: result });
+					return;
+				}
+				if (op === "git-commit") {
+					if (!this.hasMcpAccess(fromAgent, "terminal") || !this.hasMcpAccess(fromAgent, "files")) {
+						runtime.process.send({
+							type: "workspace-result",
+							requestId,
+							error: "MCP access denied: terminal and files are required for git-commit",
+						});
+						return;
+					}
+					const result = await this.gitCommitInWorkspace(
+						runtime.workspaceRoot,
+						String(payload.repoPath ?? "."),
+						String(payload.message ?? ""),
+						payload.addAll !== false,
+					);
+					runtime.process.send({ type: "workspace-result", requestId, data: result });
+					return;
+				}
+				if (op === "git-push") {
+					if (!this.hasMcpAccess(fromAgent, "terminal") || !this.hasMcpAccess(fromAgent, "files")) {
+						runtime.process.send({
+							type: "workspace-result",
+							requestId,
+							error: "MCP access denied: terminal and files are required for git-push",
+						});
+						return;
+					}
+					const result = await this.gitPushInWorkspace(
+						runtime.workspaceRoot,
+						String(payload.repoPath ?? "."),
+						String(payload.remote ?? "origin"),
+						String(payload.branch ?? ""),
+					);
+					runtime.process.send({ type: "workspace-result", requestId, data: result });
+					return;
+				}
+				if (op === "pr-create") {
+					if (!this.hasMcpAccess(fromAgent, "terminal") || !this.hasMcpAccess(fromAgent, "files")) {
+						runtime.process.send({
+							type: "workspace-result",
+							requestId,
+							error: "MCP access denied: terminal and files are required for pr-create",
+						});
+						return;
+					}
+					const result = await this.createPullRequestInWorkspace(
+						runtime.workspaceRoot,
+						String(payload.repoPath ?? "."),
+						String(payload.title ?? ""),
+						String(payload.body ?? ""),
+						String(payload.base ?? ""),
+						String(payload.head ?? ""),
+						payload.draft === true,
+					);
+					runtime.process.send({ type: "workspace-result", requestId, data: result });
+					return;
+				}
+				if (op === "pr-approve") {
+					if (!this.hasMcpAccess(fromAgent, "terminal") || !this.hasMcpAccess(fromAgent, "files")) {
+						runtime.process.send({
+							type: "workspace-result",
+							requestId,
+							error: "MCP access denied: terminal and files are required for pr-approve",
+						});
+						return;
+					}
+					const result = await this.approvePullRequestInWorkspace(
+						runtime.workspaceRoot,
+						String(payload.repoPath ?? "."),
+						String(payload.prNumber ?? ""),
+						String(payload.prUrl ?? ""),
+						String(payload.body ?? ""),
 					);
 					runtime.process.send({ type: "workspace-result", requestId, data: result });
 					return;
@@ -1104,35 +1226,146 @@ class OfficeOrchestrator {
 		return { path: destination, repoUrl };
 	}
 
+	private resolveRepoPath(workspaceRoot: string, repoPath: string): string {
+		const resolved = repoPath
+			? path.resolve(workspaceRoot, repoPath)
+			: workspaceRoot;
+		if (!isPathInside(workspaceRoot, resolved)) {
+			throw new Error("Invalid repoPath outside agent workspace");
+		}
+		return resolved;
+	}
+
+	private async runCommand(
+		command: string,
+		args: string[],
+		cwd: string,
+	): Promise<{ stdout: string; stderr: string }> {
+		return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+			const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+			let stdout = "";
+			let stderr = "";
+
+			child.stdout?.on("data", (chunk) => {
+				stdout += String(chunk);
+			});
+			child.stderr?.on("data", (chunk) => {
+				stderr += String(chunk);
+			});
+
+			child.on("exit", (code) => {
+				if (code === 0) {
+					resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
+					return;
+				}
+				reject(new Error(`${command} ${args.join(" ")} failed with code ${code}. ${stderr || stdout}`));
+			});
+			child.on("error", reject);
+		});
+	}
+
+	private async gitCommitInWorkspace(
+		workspaceRoot: string,
+		repoPath: string,
+		message: string,
+		addAll: boolean,
+	): Promise<{ repoPath: string; message: string; committed: boolean; output?: string }> {
+		if (!message.trim()) {
+			throw new Error("git-commit requires message");
+		}
+		const repoRoot = this.resolveRepoPath(workspaceRoot, repoPath);
+		if (addAll) {
+			await this.runCommand("git", ["add", "-A"], repoRoot);
+		}
+		const result = await this.runCommand("git", ["commit", "-m", message], repoRoot);
+		return {
+			repoPath: repoRoot,
+			message,
+			committed: true,
+			output: result.stdout || result.stderr || undefined,
+		};
+	}
+
+	private async gitPushInWorkspace(
+		workspaceRoot: string,
+		repoPath: string,
+		remote: string,
+		branch: string,
+	): Promise<{ repoPath: string; remote: string; branch?: string; pushed: boolean; output?: string }> {
+		const repoRoot = this.resolveRepoPath(workspaceRoot, repoPath);
+		const args = branch.trim() ? ["push", remote || "origin", branch] : ["push", remote || "origin"];
+		const result = await this.runCommand("git", args, repoRoot);
+		return {
+			repoPath: repoRoot,
+			remote: remote || "origin",
+			branch: branch || undefined,
+			pushed: true,
+			output: result.stdout || result.stderr || undefined,
+		};
+	}
+
+	private async createPullRequestInWorkspace(
+		workspaceRoot: string,
+		repoPath: string,
+		title: string,
+		body: string,
+		base: string,
+		head: string,
+		draft: boolean,
+	): Promise<{ repoPath: string; created: boolean; prUrl?: string; output?: string }> {
+		if (!title.trim()) {
+			throw new Error("pr-create requires title");
+		}
+		const repoRoot = this.resolveRepoPath(workspaceRoot, repoPath);
+		const args = ["pr", "create", "--title", title, "--body", body || ""]; 
+		if (base.trim()) {
+			args.push("--base", base);
+		}
+		if (head.trim()) {
+			args.push("--head", head);
+		}
+		if (draft) {
+			args.push("--draft");
+		}
+		const result = await this.runCommand("gh", args, repoRoot);
+		return {
+			repoPath: repoRoot,
+			created: true,
+			prUrl: result.stdout.split("\n").find((line) => /^https?:\/\//i.test(line.trim())),
+			output: result.stdout || result.stderr || undefined,
+		};
+	}
+
+	private async approvePullRequestInWorkspace(
+		workspaceRoot: string,
+		repoPath: string,
+		prNumber: string,
+		prUrl: string,
+		body: string,
+	): Promise<{ repoPath: string; approved: boolean; target: string; output?: string }> {
+		const repoRoot = this.resolveRepoPath(workspaceRoot, repoPath);
+		const target = prUrl.trim() || prNumber.trim();
+		if (!target) {
+			throw new Error("pr-approve requires prNumber or prUrl");
+		}
+		const args = ["pr", "review", target, "--approve"];
+		if (body.trim()) {
+			args.push("--body", body);
+		}
+		const result = await this.runCommand("gh", args, repoRoot);
+		return {
+			repoPath: repoRoot,
+			approved: true,
+			target,
+			output: result.stdout || result.stderr || undefined,
+		};
+	}
+
 	private startStandupLoop(): void {
 		const intervalMs = this.officeConfig.standupIntervalMinutes * 60 * 1000;
 		this.standupTimer = setInterval(() => {
 			this.triggerStandup();
 		}, intervalMs);
-	}
-
-	private startContinuousWorkLoop(): void {
-		this.triggerContinuousWorkPulse("startup");
-		const intervalMs = this.officeConfig.continuousWorkIntervalMinutes * 60 * 1000;
-		this.continuousWorkTimer = setInterval(() => {
-			this.triggerContinuousWorkPulse("interval");
-		}, intervalMs);
-		logLine(
-			"🔁",
-			"work-loop",
-			`Continuous work pulse every ${this.officeConfig.continuousWorkIntervalMinutes} minute(s)`,
-		);
-	}
-
-	private triggerContinuousWorkPulse(reason: "startup" | "interval" | "manual"): void {
-		for (const runtime of this.runtimes.values()) {
-			runtime.process.send({
-				type: "chat",
-				from: "SYSTEM",
-				text: `continue-task: Keep advancing the main target with concrete progress. Main target: ${this.officeConfig.mainTarget}. Report meaningful findings, and when relevant send standup-report updates to ${this.officeConfig.standupLeader}.`,
-			});
-		}
-		logLine("🛠️", "work", `Continuous work pulse sent to ${this.runtimes.size} agent(s) [${reason}]`);
 	}
 
 	private triggerStandup(): void {

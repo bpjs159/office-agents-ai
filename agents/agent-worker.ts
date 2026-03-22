@@ -50,6 +50,9 @@ const currentStandupReports = new Map<string, string>();
 
 const TRACE_ENABLED = (process.env.AGENT_TRACE ?? "1") !== "0";
 let llmTraceEnabled = (process.env.AGENT_LLM_TRACE ?? "0") === "1";
+const SELF_WORK_INTERVAL_SECONDS = Math.max(15, Number(process.env.AGENT_SELF_WORK_INTERVAL_SECONDS ?? 120) || 120);
+let selfWorkTimer: NodeJS.Timeout | undefined;
+let selfWorkRunning = false;
 
 function nextId(prefix: string): string {
 	return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -246,9 +249,71 @@ function stripStandupPrefix(text: string): string {
 	return text.replace("standup-report:", "").trim();
 }
 
+function shouldSuppressDirectReply(msg: WorkerMessage, from: string, text: string): boolean {
+	const control = (msg.control ?? {}) as Record<string, unknown>;
+	if (control.suppressReply === true) {
+		return true;
+	}
+	if (from === "SYSTEM") {
+		const normalized = text.trim().toLowerCase();
+		if (normalized.startsWith("continue-task:")) {
+			return true;
+		}
+		if (normalized.includes("standup time")) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function startSelfWorkLoop(): void {
+	if (selfWorkTimer) {
+		return;
+	}
+
+	const runSelfWork = async (reason: "startup" | "interval") => {
+		if (selfWorkRunning) {
+			return;
+		}
+		selfWorkRunning = true;
+		try {
+			await handleChat({
+				type: "chat",
+				from: "SYSTEM",
+				text: `continue-task: Keep advancing current objectives with concrete progress. If needed, coordinate with peers and include evidence-backed updates in the next standup-report. [self-loop:${reason}]`,
+				control: { suppressReply: true, source: "self-work-loop", reason },
+			});
+			trace("self-work.executed", { reason });
+		} catch (error) {
+			trace("self-work.error", { reason, error: String(error) });
+		} finally {
+			selfWorkRunning = false;
+		}
+	};
+
+	void runSelfWork("startup");
+	selfWorkTimer = setInterval(() => {
+		void runSelfWork("interval");
+	}, SELF_WORK_INTERVAL_SECONDS * 1000);
+	trace("self-work.started", { intervalSeconds: SELF_WORK_INTERVAL_SECONDS });
+}
+
 type WorkspaceAction =
 	| { kind: "create-file"; relativePath: string; content: string }
-	| { kind: "clone-repo"; repoUrl: string; targetFolder?: string };
+	| { kind: "clone-repo"; repoUrl: string; targetFolder?: string }
+	| { kind: "wait"; seconds?: number; untilMessage?: boolean }
+	| { kind: "git-commit"; repoPath: string; message: string; addAll: boolean }
+	| { kind: "git-push"; repoPath: string; remote?: string; branch?: string }
+	| {
+		kind: "pr-create";
+		repoPath: string;
+		title: string;
+		body?: string;
+		base?: string;
+		head?: string;
+		draft: boolean;
+	}
+	| { kind: "pr-approve"; repoPath: string; prNumber?: string; prUrl?: string; body?: string };
 
 function sanitizeWorkspaceRelativePath(rawPath: string): string {
 	let cleaned = String(rawPath ?? "").trim();
@@ -308,6 +373,70 @@ function parseWorkspaceActions(reply: string): { cleanedReply: string; actions: 
 		return "";
 	});
 
+	const waitUntilMessageRegex = /<<WAIT\s+until="message"\s*>><<\/WAIT>>/g;
+	cleaned = cleaned.replace(waitUntilMessageRegex, () => {
+		actions.push({ kind: "wait", untilMessage: true });
+		return "";
+	});
+
+	const waitSecondsRegex = /<<WAIT\s+seconds="([^"]+)"\s*>><<\/WAIT>>/g;
+	cleaned = cleaned.replace(waitSecondsRegex, (_match, secondsRaw: string) => {
+		const seconds = Number(secondsRaw);
+		actions.push({ kind: "wait", seconds: Number.isFinite(seconds) ? seconds : undefined });
+		return "";
+	});
+
+	const gitCommitRegex = /<<GIT_COMMIT\s+repo="([^"]+)"\s+message="([^"]+)"(?:\s+add_all="([^"]+)")?\s*>><<\/GIT_COMMIT>>/g;
+	cleaned = cleaned.replace(gitCommitRegex, (_match, repoPath: string, message: string, addAllRaw?: string) => {
+		actions.push({
+			kind: "git-commit",
+			repoPath: String(repoPath).trim() || ".",
+			message: String(message).trim(),
+			addAll: String(addAllRaw ?? "true").trim().toLowerCase() !== "false",
+		});
+		return "";
+	});
+
+	const gitPushRegex = /<<GIT_PUSH\s+repo="([^"]+)"(?:\s+remote="([^"]+)")?(?:\s+branch="([^"]+)")?\s*>><<\/GIT_PUSH>>/g;
+	cleaned = cleaned.replace(gitPushRegex, (_match, repoPath: string, remote?: string, branch?: string) => {
+		actions.push({
+			kind: "git-push",
+			repoPath: String(repoPath).trim() || ".",
+			remote: String(remote ?? "").trim() || undefined,
+			branch: String(branch ?? "").trim() || undefined,
+		});
+		return "";
+	});
+
+	const prCreateRegex = /<<PR_CREATE\s+repo="([^"]+)"\s+title="([^"]+)"(?:\s+body="([\s\S]*?)")?(?:\s+base="([^"]+)")?(?:\s+head="([^"]+)")?(?:\s+draft="([^"]+)")?\s*>><<\/PR_CREATE>>/g;
+	cleaned = cleaned.replace(
+		prCreateRegex,
+		(_match, repoPath: string, title: string, body?: string, base?: string, head?: string, draftRaw?: string) => {
+			actions.push({
+				kind: "pr-create",
+				repoPath: String(repoPath).trim() || ".",
+				title: String(title).trim(),
+				body: String(body ?? "").trim() || undefined,
+				base: String(base ?? "").trim() || undefined,
+				head: String(head ?? "").trim() || undefined,
+				draft: String(draftRaw ?? "false").trim().toLowerCase() === "true",
+			});
+			return "";
+		},
+	);
+
+	const prApproveRegex = /<<PR_APPROVE\s+repo="([^"]+)"(?:\s+number="([^"]+)")?(?:\s+url="([^"]+)")?(?:\s+body="([\s\S]*?)")?\s*>><<\/PR_APPROVE>>/g;
+	cleaned = cleaned.replace(prApproveRegex, (_match, repoPath: string, number?: string, url?: string, body?: string) => {
+		actions.push({
+			kind: "pr-approve",
+			repoPath: String(repoPath).trim() || ".",
+			prNumber: String(number ?? "").trim() || undefined,
+			prUrl: String(url ?? "").trim() || undefined,
+			body: String(body ?? "").trim() || undefined,
+		});
+		return "";
+	});
+
 	cleaned = cleaned.replace(/\n{3,}/g, "\n\n").trim();
 	return { cleanedReply: cleaned, actions };
 }
@@ -326,6 +455,91 @@ async function executeWorkspaceActions(actions: WorkspaceAction[]): Promise<stri
 				failed
 					? `- create-file ${action.relativePath}: failed (${(result as { error: string }).error})`
 					: `- create-file ${action.relativePath}: ok`,
+			);
+			continue;
+		}
+
+		if (action.kind === "wait") {
+			const payload = action.untilMessage
+				? { mode: "until-message", untilMessage: true }
+				: { mode: "seconds", seconds: Number(action.seconds ?? 0) };
+			const result = await requestWorkspace("wait", payload).catch((error) => ({ error: String(error) }));
+			const failed = Boolean((result as { error?: string }).error);
+			trace("workspace.wait", { payload, ok: !failed });
+			results.push(
+				failed
+					? `- wait: failed (${(result as { error: string }).error})`
+					: action.untilMessage
+						? "- wait until-message: resumed"
+						: `- wait ${String(action.seconds ?? 0)}s: elapsed`,
+			);
+			continue;
+		}
+
+		if (action.kind === "git-commit") {
+			const result = await requestWorkspace("git-commit", {
+				repoPath: action.repoPath,
+				message: action.message,
+				addAll: action.addAll,
+			}).catch((error) => ({ error: String(error) }));
+			const failed = Boolean((result as { error?: string }).error);
+			trace("workspace.git-commit", { repoPath: action.repoPath, ok: !failed });
+			results.push(
+				failed
+					? `- git-commit ${action.repoPath}: failed (${(result as { error: string }).error})`
+					: `- git-commit ${action.repoPath}: ok`,
+			);
+			continue;
+		}
+
+		if (action.kind === "git-push") {
+			const result = await requestWorkspace("git-push", {
+				repoPath: action.repoPath,
+				remote: action.remote ?? "origin",
+				branch: action.branch ?? "",
+			}).catch((error) => ({ error: String(error) }));
+			const failed = Boolean((result as { error?: string }).error);
+			trace("workspace.git-push", { repoPath: action.repoPath, ok: !failed });
+			results.push(
+				failed
+					? `- git-push ${action.repoPath}: failed (${(result as { error: string }).error})`
+					: `- git-push ${action.repoPath}: ok`,
+			);
+			continue;
+		}
+
+		if (action.kind === "pr-create") {
+			const result = await requestWorkspace("pr-create", {
+				repoPath: action.repoPath,
+				title: action.title,
+				body: action.body ?? "",
+				base: action.base ?? "",
+				head: action.head ?? "",
+				draft: action.draft,
+			}).catch((error) => ({ error: String(error) }));
+			const failed = Boolean((result as { error?: string }).error);
+			trace("workspace.pr-create", { repoPath: action.repoPath, ok: !failed });
+			results.push(
+				failed
+					? `- pr-create ${action.repoPath}: failed (${(result as { error: string }).error})`
+					: `- pr-create ${action.repoPath}: ok`,
+			);
+			continue;
+		}
+
+		if (action.kind === "pr-approve") {
+			const result = await requestWorkspace("pr-approve", {
+				repoPath: action.repoPath,
+				prNumber: action.prNumber ?? "",
+				prUrl: action.prUrl ?? "",
+				body: action.body ?? "",
+			}).catch((error) => ({ error: String(error) }));
+			const failed = Boolean((result as { error?: string }).error);
+			trace("workspace.pr-approve", { repoPath: action.repoPath, ok: !failed });
+			results.push(
+				failed
+					? `- pr-approve ${action.repoPath}: failed (${(result as { error: string }).error})`
+					: `- pr-approve ${action.repoPath}: ok`,
 			);
 			continue;
 		}
@@ -437,6 +651,7 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 				text: "standup-request: send your latest findings, evidence links, and next actions now.",
 			});
 		}
+		return;
 	}
 
 	if (text.startsWith("standup-request:")) {
@@ -549,8 +764,12 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 		metadata: { direction: "outgoing", to: from },
 	}).catch(() => undefined);
 
-	send({ type: "chat", from: profile.name, to: from, text: reply });
-	trace("chat.sent", { to: from, length: reply.length });
+	if (!shouldSuppressDirectReply(msg, from, text)) {
+		send({ type: "chat", from: profile.name, to: from, text: reply });
+		trace("chat.sent", { to: from, length: reply.length });
+	} else {
+		trace("chat.suppressed", { to: from, reason: "control-message" });
+	}
 
 	if (text.startsWith("delegate:")) {
 		const payload = text.replace("delegate:", "").trim();
@@ -580,6 +799,7 @@ process.on("message", async (msg: WorkerMessage | null) => {
 			mcpAccess: profile.mcpAccess,
 			peers: profile.peers,
 		});
+		startSelfWorkLoop();
 		send({
 			type: "ready",
 			name: profile.name,
