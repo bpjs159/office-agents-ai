@@ -648,7 +648,7 @@ async function handleChat(msg: WorkerMessage): Promise<void> {
 				type: "chat",
 				from: profile.name,
 				to: peer,
-				text: "standup-request: send your latest findings, evidence links, and next actions now.",
+				text: "standup-request: send your latest update, including progress, blockers, and next steps.",
 			});
 		}
 		return;
